@@ -13,6 +13,82 @@ interactive browser, and it takes the same flags as the subcommands, so
 go build -o getfm ./cmd/getfm
 ```
 
+## Getting started
+
+Build it and put it somewhere on your `PATH`:
+
+```
+make build      # optimized binary in bin/
+make install    # copy into ~/.local/bin
+```
+
+Check what is wired up before trusting any of it. `getfm providers` prints one
+row per provider with how many models each returned, whether a key was found,
+and whether the endpoint can be probed:
+
+```
+PROVIDER      MODELS  KEY  PROBE  FREE  ENDPOINT
+openrouter    464     -    yes    -     https://openrouter.ai/api/v1/models
+kilocode      399     -    yes    -     https://api.kilo.ai/api/gateway/models
+```
+
+Listing free models needs no key at all, because catalogues are public. A probe
+may need one, and getfm tells you when it is missing rather than failing quietly.
+
+```
+getfm list                              # every free model
+getfm list -providers kilocode          # just one provider
+getfm list -free zero                   # only models priced at zero
+getfm test kilocode/qwen/qwen3-235b:free
+```
+
+Then open the browser, which is what most people actually want:
+
+```
+getfm
+```
+
+## Configuring providers.json
+
+Providers are described by `providers.json`. getfm looks in the working
+directory first, then your per-user config directory, so a checkout runs with no
+setup and an installed binary can still find a catalog you own.
+
+The bundled catalog has four providers. Adding your own is a JSON edit rather
+than a code change, and this is the smallest entry that is useful:
+
+```json
+{
+  "providers": [
+    {
+      "name": "example",
+      "label": "Example",
+      "base_url": "https://api.example.com/v1",
+      "models_path": "/models",
+      "mapping": { "list": "data", "id": "id" },
+      "completions": {
+        "path": "/chat/completions",
+        "auth_header": "Authorization",
+        "auth_prefix": "Bearer ",
+        "body": "{\"model\":\"{{.Model}}\",\"messages\":[{\"role\":\"user\",\"content\":\"{{.Prompt}}\"}],\"max_tokens\":1}"
+      }
+    }
+  ]
+}
+```
+
+Check a catalog before relying on it. `getfm providers` will report a missing or
+mistyped field at load time rather than discovering it on your first fetch:
+
+```
+getfm providers -config /path/to/providers.json
+```
+
+Keys are optional and are never written into this file. Pass one on the command
+line with `-key example=sk-...`, or let getfm read the environment variables
+named in `env_keys`. Both are covered in [API keys](#api-keys), and every field
+is documented under [Configuration](#configuration).
+
 ## The browser
 
 ```
@@ -361,3 +437,6 @@ The command line is driven through `cli.Main` with both streams captured, so
 flag parsing, the three exit codes, the JSON documents and the resolution of
 `provider/model` are covered without a network. Provider endpoints in the suite
 are local `httptest` servers, and no test needs an API key.
+## License
+
+MIT. See [LICENSE](LICENSE).
