@@ -247,6 +247,47 @@ func TestListJSONIsAMachineReadableDocument(t *testing.T) {
 	}
 }
 
+// TestListInjectsTheEnvKeyIntoDeclaredHeaders covers the whole path a catalog
+// takes: env_keys resolves a credential, the header template consumes it, and
+// the models request arrives with it. A provider whose catalog is gated cannot
+// be listed without this.
+func TestListInjectsTheEnvKeyIntoDeclaredHeaders(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-list-key-value" {
+			t.Errorf("auth header = %q, want the env key injected", got)
+		}
+	})
+	path := writeCatalog(t, catalogProvider(srv.URL, func(p map[string]any) {
+		p["headers"] = map[string]any{"Authorization": "Bearer {{.Key}}"}
+	}))
+	t.Setenv("ALPHA_KEY", "sk-list-key-value")
+
+	code, stdout, stderr := runMain(t, "list", "-config", path)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if !strings.Contains(stdout, "free-model:free") {
+		t.Errorf("stdout is missing the listed models:\n%s", stdout)
+	}
+}
+
+// TestListSendsNoAuthWhenTheCatalogDeclaresNone pins the other half: a
+// provider that declares no headers gets a bare models request even when a key
+// is available, because most models endpoints are public.
+func TestListSendsNoAuthWhenTheCatalogDeclaresNone(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("undeclared auth header = %q, want none", got)
+		}
+	})
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+	t.Setenv("ALPHA_KEY", "sk-list-key-value")
+
+	if code, _, stderr := runMain(t, "list", "-config", path); code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+}
+
 func TestListFailsWhenEveryProviderFails(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "upstream is unwell", http.StatusBadGateway)

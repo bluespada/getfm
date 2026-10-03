@@ -1,7 +1,11 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -114,6 +118,103 @@ func TestParseMissingListIsAnError(t *testing.T) {
 	p := &config.Provider{Name: "x", Mapping: config.Mapping{List: "data", ID: "id"}}
 	if _, err := parseJSON(t, p, `{"models":[]}`); err == nil {
 		t.Fatal("expected an error when the configured array is absent")
+	}
+}
+
+// modelsServer answers a models request and reports the headers it was sent.
+func modelsServer(t *testing.T, got *http.Header) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, `{"data":[{"id":"m"}]}`); err != nil {
+			t.Error(err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestListSendsDeclaredHeaders(t *testing.T) {
+	var got http.Header
+	srv := modelsServer(t, &got)
+
+	p := &config.Provider{
+		Name:       "gated",
+		BaseURL:    srv.URL,
+		ModelsPath: "/models",
+		Mapping:    config.Mapping{List: "data", ID: "id"},
+		Headers:    map[string]string{"Authorization": "Bearer {{.Key}}", "X-Client": "getfm"},
+	}
+	if err := p.CompileHeaders(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := List(context.Background(), srv.Client(), p, "sk-models-secret", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if v := got.Get("Authorization"); v != "Bearer sk-models-secret" {
+		t.Errorf("Authorization = %q, want the key injected into the template", v)
+	}
+	if v := got.Get("X-Client"); v != "getfm" {
+		t.Errorf("a value with no placeholder should pass through, got %q", v)
+	}
+}
+
+func TestListSendsNothingWhenNoKeyResolves(t *testing.T) {
+	var got http.Header
+	srv := modelsServer(t, &got)
+
+	p := &config.Provider{
+		Name:       "gated",
+		BaseURL:    srv.URL,
+		ModelsPath: "/models",
+		Mapping:    config.Mapping{List: "data", ID: "id"},
+		Headers:    map[string]string{"Authorization": "Bearer {{.Key}}"},
+	}
+	if err := p.CompileHeaders(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := List(context.Background(), srv.Client(), p, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	// "Authorization: Bearer " would be worse than no header at all.
+	if v := got.Get("Authorization"); v != "" {
+		t.Errorf("a declared header reached a request with no key: %q", v)
+	}
+}
+
+// TestListSendsNoAuthUnlessDeclared pins the rule that only declared headers go
+// out. A provider that declares auth for completions has not asked for it on
+// the models request, and most of those endpoints are public.
+func TestListSendsNoAuthUnlessDeclared(t *testing.T) {
+	var got http.Header
+	srv := modelsServer(t, &got)
+
+	p := &config.Provider{
+		Name:       "public",
+		BaseURL:    srv.URL,
+		ModelsPath: "/models",
+		Mapping:    config.Mapping{List: "data", ID: "id"},
+		Completions: &config.Probe{
+			Path: "/chat", AuthHeader: "Authorization", AuthPrefix: "Bearer ", Body: "{}",
+		},
+	}
+	if _, err := List(context.Background(), srv.Client(), p, "sk-models-secret", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if v := got.Get("Authorization"); v != "" {
+		t.Errorf("undeclared header was sent anyway: %q", v)
+	}
+}
+
+func TestModelsHeadersRefusesRenderedLineBreaks(t *testing.T) {
+	p := &config.Provider{Headers: map[string]string{"X-Key": "{{.Key}}"}}
+	if err := p.CompileHeaders(); err != nil {
+		t.Fatal(err)
+	}
+	// A key with a newline in it could otherwise rewrite the request carrying it.
+	if _, err := p.ModelsHeaders("abc\r\nX-Admin: true"); err == nil {
+		t.Fatal("expected an error for a value containing a line break")
 	}
 }
 

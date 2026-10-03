@@ -297,6 +297,20 @@ id before it is used in a request, which Gemini needs.
 containing quotes cannot break the request. Omit `completions` for a provider
 that can be listed but not probed.
 
+`headers` is optional, and only a provider that gates its models endpoint
+behind auth needs it. Each value is a template rendered with `{{.Key}}`, which
+expands to the key resolved for that provider, so the credential is never
+written into the file:
+
+```json
+"headers": { "Authorization": "Bearer {{.Key}}" }
+```
+
+A provider that declares no `headers` gets a models request with no credential
+attached, which is what all four bundled providers expect. When a provider
+resolves no key, no declared header is sent rather than one carrying an empty
+credential.
+
 Unknown fields are rejected at load time, so a typo fails loudly instead of
 silently doing nothing.
 
@@ -341,6 +355,9 @@ Resolution order is `-key provider=value` first, then the provider's `env_keys`
 in order. Keys are never written to disk and never printed; `providers` reports
 only which variable a key came from. Error bodies are scrubbed of anything
 key-shaped before display, since some providers echo the credential back.
+
+A key reaches the models endpoint only where a provider says so, through
+`headers`; everywhere else the catalogue request stays anonymous.
 
 `-c` defaults to 2 for probes because free tiers are usually rate limited. A 429
 is reported per model rather than retried.

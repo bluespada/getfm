@@ -30,6 +30,13 @@ type Provider struct {
 	ModelsPath string `json:"models_path"`
 	// EnvKeys are inspected in order; the first non-empty one supplies the key.
 	EnvKeys []string `json:"env_keys"`
+	// Headers are sent with the models request. Most models endpoints are
+	// public, so this is empty for most providers; one that gates its catalog
+	// behind auth declares what to send here, for example
+	// {"Authorization": "Bearer {{.Key}}"}.
+	Headers map[string]string `json:"headers"`
+	// compiledHeaders holds Headers parsed into templates at load time.
+	compiledHeaders []headerTemplate
 	// FreeAlways marks every model from this provider as free. Local endpoints
 	// that cost nothing to run use this instead of declaring pricing.
 	FreeAlways bool `json:"free_always"`
@@ -152,6 +159,9 @@ func (p *Provider) normalize() error {
 		p.Label = p.Name
 	}
 	if err := p.CompileFreeIDs(); err != nil {
+		return fmt.Errorf("provider %s: %w", p.Name, err)
+	}
+	if err := p.CompileHeaders(); err != nil {
 		return fmt.Errorf("provider %s: %w", p.Name, err)
 	}
 

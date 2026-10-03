@@ -110,12 +110,20 @@ func List(ctx context.Context, client *http.Client, p *config.Provider, key stri
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
-	// A key is optional: most models endpoints are public, so only attach one
-	// when the catalog declared somewhere to put it.
-	if key != "" && p.Completions != nil && p.Completions.AuthHeader != "" {
-		req.Header.Set(p.Completions.AuthHeader, p.Completions.AuthPrefix+key)
-	}
 	req.Header.Set("Accept", "application/json")
+	// A key on its own is not enough to say what to send, so the catalog says
+	// it: most models endpoints are public and want no credential at all,
+	// while the ones that gate their catalog behind auth declare the headers
+	// to send. Those win over the defaults set above.
+	if key != "" {
+		headers, err := p.ModelsHeaders(key)
+		if err != nil {
+			return nil, err
+		}
+		for name, value := range headers {
+			req.Header.Set(name, value)
+		}
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

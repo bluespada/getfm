@@ -55,6 +55,10 @@ func TestLoadRejectsBadCatalogs(t *testing.T) {
 		"missing base url": `{"providers":[{"name":"a","mapping":{"id":"id"}}]}`,
 		"missing id map":   `{"providers":[{"name":"a","base_url":"http://x"}]}`,
 		"unknown field":    `{"providers":[{"name":"a","base_url":"http://x","mapping":{"id":"id"},"typo":1}]}`,
+		"bad header name": `{"providers":[{"name":"a","base_url":"http://x","mapping":{"id":"id"},
+			"headers":{"X Bad Name":"v"}}]}`,
+		"bad header template": `{"providers":[{"name":"a","base_url":"http://x","mapping":{"id":"id"},
+			"headers":{"X-Key":"{{.Key"}}]}`,
 		"duplicate name": `{"providers":[
 			{"name":"a","base_url":"http://x","mapping":{"id":"id"}},
 			{"name":"a","base_url":"http://y","mapping":{"id":"id"}}]}`,
@@ -65,6 +69,34 @@ func TestLoadRejectsBadCatalogs(t *testing.T) {
 				t.Fatal("expected a validation error")
 			}
 		})
+	}
+}
+
+func TestLoadRendersModelsHeaders(t *testing.T) {
+	path := writeCatalog(t, `{"providers":[{
+		"name":"gated","base_url":"https://api.example.com","env_keys":["GATED_KEY"],
+		"headers":{"Authorization":"Bearer {{.Key}}","X-Client":"getfm"},
+		"mapping":{"list":"data","id":"id"}
+	}]}`)
+
+	file, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := file.Get("gated")
+
+	headers, err := p.ModelsHeaders("sk-live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headers["Authorization"] != "Bearer sk-live" {
+		t.Errorf("Authorization = %q, want the resolved key injected", headers["Authorization"])
+	}
+	if headers["X-Client"] != "getfm" {
+		t.Errorf("a literal value should pass through, got %q", headers["X-Client"])
+	}
+	if headers, err := p.ModelsHeaders(""); err != nil || headers != nil {
+		t.Errorf("no key should send no headers, got %v (err %v)", headers, err)
 	}
 }
 
