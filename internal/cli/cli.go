@@ -18,6 +18,7 @@ const usage = `getfm - find free models and check that their endpoints work.
 Usage:
   getfm [flags]             open the interactive browser
   getfm list [flags]        list free models from the configured providers
+  getfm diff [flags]        show models new since the last run, then record them
   getfm test [flags] [MODEL]  send a minimal completion to verify an endpoint
   getfm providers [flags]   show the configured providers and key status
   getfm help                show this help
@@ -28,6 +29,9 @@ everything currently listed. Press c or ctrl+c to copy a model id.
 
 MODEL is written provider/model, for example openrouter/qwen/qwen3.8-27b:free.
 With -all, every free model is probed instead.
+
+list, diff and test take -format=table|csv|md|json and -q for scripting. diff
+writes the model store, list -new-only only reads it.
 
 Run "getfm <command> -h" for the flags of a single command.
 `
@@ -54,6 +58,8 @@ func Main(args []string) int {
 	switch command {
 	case "list":
 		code = runList(rest)
+	case "diff":
+		code = runDiff(rest)
 	case "test":
 		code = runTest(rest)
 	case "providers":

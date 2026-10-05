@@ -134,7 +134,8 @@ prefixed with `+`, and the header counts them.
 Press `S` to refresh and write the record. The marks last the rest of the
 session: refreshing again will not erase the models the refresh just revealed,
 which is the whole point of asking for a refresh. Next launch they are simply
-known.
+known. `getfm diff` asks the same question from a shell and writes the same
+record.
 
 The record lives in the user cache directory, `%LocalAppData%\getfm` on Windows,
 `~/Library/Caches/getfm` on macOS, `$XDG_CACHE_HOME/getfm` or `~/.cache/getfm`
@@ -160,7 +161,10 @@ the detail that matters.
 
 The request view works before anything has been probed, so you can inspect
 exactly what getfm would send. `enter` runs a probe from inside the modal and
-the response fills in behind it.
+the response fills in behind it. A failed probe adds a `reason` naming what went
+wrong, tinted by how much of it is yours to fix: `rate` in amber for a throttle,
+`auth` in red for a rejected credential, `gone` muted for a model the provider
+has withdrawn.
 
 Bodies are re-indented when they are JSON and shown verbatim when they are not.
 The captured credential slot renders as `Bearer [redacted]` so you can see that
@@ -196,6 +200,7 @@ different from a price of `$0.00`.
 
 ```
 getfm list [flags]              list free models
+getfm diff [flags]              show what is new since the last run, then record it
 getfm test [flags] [MODEL]      send a minimal completion
 getfm providers [flags]         show configured providers and key status
 ```
@@ -210,8 +215,44 @@ getfm test kilocode/kilo-auto/free
 getfm test -providers kilocode -all -n 10 -c 3
 ```
 
-Both take `-json`. `test` exits non-zero if any probe fails, so it works as a CI
-check. Without a terminal the browser falls back to the listing.
+`list`, `diff` and `test` take `-format=table|csv|md|json` and `-q`. The formats
+all carry the same document, so a pipe does not have to care which one it is
+reading; `-q` drops the closing summary line and leaves warnings on stderr, where
+they cannot corrupt stdout.
+
+```bash
+getfm list -q -format=csv | cut -d, -f2   # model ids only
+getfm test -all -format=md > report.md    # a document a person can read
+```
+
+`test` exits non-zero if any probe fails, so it works as a CI check. Each failed
+row names a class as well as a status: `auth` for a rejected credential, `quota`
+for an exhausted allowance, `rate` for throttling, `gone` for a model the
+provider has withdrawn, plus `network`, `timeout`, `config` and `server`. Without
+a terminal the browser falls back to the listing.
+
+### What changed
+
+`diff` compares the catalog against a record of what the providers offered last
+time, prints what is new and what is no longer listed, and writes that record
+back. It records every model a provider lists, not just the free ones, so
+changing `-free` does not make the whole catalog look new again. A run where
+nothing moved leaves the record alone, so its timestamps keep saying when the
+catalog was last seen to change.
+
+```bash
+getfm diff                    # what appeared and what left, then remember it
+getfm list -new-only          # the same question, without writing anything
+getfm diff -store ./seen.json # keep the record next to your scripts
+```
+
+Every format carries both halves: the table and markdown print the models no
+longer listed after the new ones, and the CSV gains a `state` column marking
+each row `new` or `gone`. A provider that could not be reached is skipped rather
+than treated as having withdrawn everything, so one flaky endpoint does not
+empty the diff. `list -new-only` only reads the record and names where it
+lives; `diff` is the command that consumes it, and the browser's `S` writes it
+too.
 
 ## Deciding what counts as free
 
@@ -451,7 +492,8 @@ open/close and paging, credential redaction in the request view, and assertions
 that the rendered frame and the overlay both fit the terminal at several sizes.
 
 The command line is driven through `cli.Main` with both streams captured, so
-flag parsing, the three exit codes, the JSON documents and the resolution of
+flag parsing, the three exit codes, the output documents in each format, what
+`diff` records and `list -new-only` leaves alone, and the resolution of
 `provider/model` are covered without a network. Provider endpoints in the suite
 are local `httptest` servers, and no test needs an API key.
 ## License

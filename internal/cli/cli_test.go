@@ -1,17 +1,22 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bluespada/getfm/pkg/config"
 	"github.com/bluespada/getfm/pkg/provider"
+	"github.com/bluespada/getfm/pkg/store"
 )
 
 // The command line is tested through Main, against a local httptest server, so
@@ -467,6 +472,439 @@ func TestTestRejectsBadArguments(t *testing.T) {
 				t.Errorf("%v succeeded, want a non-zero exit", args)
 			}
 		})
+	}
+}
+
+// seedStore writes a store holding the given ids per provider, so a command
+// that compares against history can be tested without one.
+func seedStore(t *testing.T, path string, known map[string][]string) {
+	t.Helper()
+	now := time.Now().UTC()
+	s := &store.Store{Version: store.Version, Models: map[string]store.ProviderRecord{}}
+	for name, ids := range known {
+		seen := make(map[string]time.Time, len(ids))
+		for _, id := range ids {
+			seen[id] = now
+		}
+		s.Models[name] = store.ProviderRecord{Updated: now, Seen: seen}
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// storedIDs reads back what a store recorded, for asserting that a command
+// wrote, or did not write, it.
+func storedIDs(t *testing.T, path, providerName string) map[string]bool {
+	t.Helper()
+	s, err := store.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s.Known(providerName)
+}
+
+func TestListCSVIsReadableByACSVParser(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+
+	code, stdout, stderr := runMain(t, "list", "-format=csv", "-config", path)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	rows, err := csv.NewReader(strings.NewReader(stdout)).ReadAll()
+	if err != nil {
+		t.Fatalf("stdout is not one CSV table: %v\n%s", err, stdout)
+	}
+	want := []string{"provider", "model", "name", "context_length",
+		"prompt_price_per_1m", "completion_price_per_1m", "free_reason", "new"}
+	if len(rows) != 3 || strings.Join(rows[0], ",") != strings.Join(want, ",") {
+		t.Fatalf("header = %v, want %v", rows[0], want)
+	}
+	// A price has to stay a number, or the format is no use to a spreadsheet.
+	if rows[1][4] != "1" || rows[1][5] != "2" {
+		t.Errorf("price columns = %q and %q, want 1 and 2 per million", rows[1][4], rows[1][5])
+	}
+	if rows[1][1] != "free-model:free" || rows[1][6] != "suffix" {
+		t.Errorf("first row = %v, want the free model by id", rows[1])
+	}
+}
+
+func TestListMarkdownIsADocument(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+
+	code, stdout, stderr := runMain(t, "list", "-format=md", "-config", path)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	for _, want := range []string{"# Free models", "| provider | model |", "free-model:free", "## Providers"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("markdown is missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestFormatJSONMatchesTheJSONFlag(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+
+	_, viaFlag, _ := runMain(t, "list", "-json", "-config", path)
+	_, viaFormat, _ := runMain(t, "list", "-format=json", "-config", path)
+
+	// Compared field by field rather than as text: the two runs fetch
+	// separately, so the elapsed time in the document differs either way.
+	var a, b listDoc
+	if err := json.Unmarshal([]byte(viaFlag), &a); err != nil {
+		t.Fatalf("-json did not produce one document: %v\n%s", err, viaFlag)
+	}
+	if err := json.Unmarshal([]byte(viaFormat), &b); err != nil {
+		t.Fatalf("-format=json did not produce one document: %v\n%s", err, viaFormat)
+	}
+	if !reflect.DeepEqual(a.Models, b.Models) || !reflect.DeepEqual(a.Free, b.Free) {
+		t.Errorf("-json gave %+v, -format=json gave %+v, want the same document", a, b)
+	}
+}
+
+func TestQuietDropsTheSummaryButKeepsTheRows(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+
+	code, stdout, stderr := runMain(t, "list", "-q", "-config", path)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if !strings.Contains(stdout, "free-model:free") {
+		t.Errorf("-q dropped the rows:\n%s", stdout)
+	}
+	if strings.Contains(stderr, "free of") {
+		t.Errorf("-q kept the summary line: %q", stderr)
+	}
+}
+
+func TestTestCSVCarriesTheFailureClass(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+	t.Setenv("ALPHA_KEY", "sk-test-key-value")
+
+	code, stdout, _ := runMain(t, "test", "-all", "-format=csv", "-config", path)
+	if code != exitError {
+		t.Fatalf("exit code = %d, want %d for failing probes", code, exitError)
+	}
+	rows, err := csv.NewReader(strings.NewReader(stdout)).ReadAll()
+	if err != nil {
+		t.Fatalf("stdout is not one CSV table: %v\n%s", err, stdout)
+	}
+	reason := -1
+	for i, h := range rows[0] {
+		if h == "reason" {
+			reason = i
+		}
+	}
+	if reason < 0 {
+		t.Fatalf("no reason column in %v", rows[0])
+	}
+	for _, row := range rows[1:] {
+		if row[reason] != "auth" {
+			t.Errorf("reason = %q, want auth for a 401:\n%v", row[reason], rows)
+		}
+	}
+	// The probe table is a second shape of the same document, so its reason
+	// column has to be present in the terminal output too.
+	_, table, _ := runMain(t, "test", "-all", "-config", path)
+	if !strings.Contains(table, "REASON") || !strings.Contains(table, "auth") {
+		t.Errorf("table is missing the reason column:\n%s", table)
+	}
+}
+
+func TestBadOutputFlagsAreUsageErrors(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+
+	cases := map[string][]string{
+		"unknown format":  {"list", "-config", path, "-format=xml"},
+		"json and csv":    {"list", "-config", path, "-json", "-format=csv"},
+		"bad test format": {"test", "-config", path, "-format=xml", "alpha/free-model:free"},
+	}
+	for name, args := range cases {
+		t.Run(name, func(t *testing.T) {
+			code, _, stderr := runMain(t, args...)
+			if code != exitUsage {
+				t.Errorf("exit code = %d, want %d", code, exitUsage)
+			}
+			if !strings.Contains(stderr, "format") {
+				t.Errorf("stderr = %q, want it to name the flag", stderr)
+			}
+		})
+	}
+}
+
+func TestDiffReportsNewModelsThenRecordsThem(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+	storePath := filepath.Join(t.TempDir(), "models-store.json")
+
+	code, stdout, stderr := runMain(t, "diff", "-config", path, "-store", storePath)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	// A first run has no history, so every free model is new, and the paid one
+	// is recorded without being reported.
+	if !strings.Contains(stdout, "free-model:free") || !strings.Contains(stdout, "zero-model") {
+		t.Errorf("stdout does not report the new models:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "paid-model") {
+		t.Errorf("a paid model was reported as new:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "2 new") {
+		t.Errorf("summary = %q, want it to count the two free models", stderr)
+	}
+	if got := storedIDs(t, storePath, "alpha"); !got["paid-model"] {
+		t.Error("the store recorded only free models, so the paid one will look new forever")
+	}
+
+	// The second run measures from what the first one recorded. The
+	// empty state goes to stdout with the rest of the comparison.
+	code, stdout, stderr = runMain(t, "diff", "-config", path, "-store", storePath)
+	if code != exitOK {
+		t.Fatalf("second run exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if !strings.Contains(stdout, "No model is new") {
+		t.Errorf("second run = %q, want it to report nothing new", stdout)
+	}
+	if strings.Contains(stdout, "free-model:free") {
+		t.Errorf("a model recorded by the first run was reported as new again:\n%s", stdout)
+	}
+}
+
+func TestDiffReportsModelsNoLongerListed(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+	storePath := filepath.Join(t.TempDir(), "models-store.json")
+	seedStore(t, storePath, map[string][]string{"alpha": {
+		"free-model:free", "zero-model", "retired-model",
+	}})
+
+	code, stdout, stderr := runMain(t, "diff", "-config", path, "-store", storePath)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if !strings.Contains(stdout, "alpha/retired-model") {
+		t.Errorf("stdout = %q, want the withdrawn model named", stdout)
+	}
+	if !strings.Contains(stderr, "1 no longer listed") {
+		t.Errorf("summary = %q, want the count", stderr)
+	}
+	if got := storedIDs(t, storePath, "alpha"); got["retired-model"] {
+		t.Error("the withdrawn model is still in the store")
+	}
+}
+
+// TestDiffLeavesAFailedProviderAlone covers the case that makes a diff
+// trustworthy: a provider that could not be reached must not have its catalog
+// read as withdrawn.
+func TestDiffLeavesAFailedProviderAlone(t *testing.T) {
+	good := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(good.URL, nil))
+	storePath := filepath.Join(t.TempDir(), "models-store.json")
+	seedStore(t, storePath, map[string][]string{"alpha": {
+		"free-model:free", "zero-model", "paid-model",
+	}})
+
+	// The provider goes away between the two runs.
+	good.Close()
+
+	code, stdout, stderr := runMain(t, "diff", "-config", path, "-store", storePath)
+	if code != exitError {
+		t.Errorf("exit code = %d, want %d when nothing could be listed", code, exitError)
+	}
+	if strings.Contains(stdout, "alpha/free-model:free\n") || strings.Contains(stdout, "no longer listed:\n") {
+		t.Errorf("an unreachable provider was read as a withdrawal:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "0 new, 0 no longer listed") {
+		t.Errorf("summary = %q, want nothing added and nothing withdrawn", stderr)
+	}
+	if got := storedIDs(t, storePath, "alpha"); !got["free-model:free"] || !got["paid-model"] {
+		t.Error("the store was overwritten by a fetch that failed")
+	}
+}
+
+func TestDiffCSVCarriesBothHalves(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+	storePath := filepath.Join(t.TempDir(), "models-store.json")
+	seedStore(t, storePath, map[string][]string{"alpha": {
+		"zero-model", "paid-model", "retired-model",
+	}})
+
+	code, stdout, stderr := runMain(t, "diff", "-format=csv", "-config", path, "-store", storePath)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	rows, err := csv.NewReader(strings.NewReader(stdout)).ReadAll()
+	if err != nil {
+		t.Fatalf("stdout is not one CSV table: %v\n%s", err, stdout)
+	}
+	if rows[0][2] != "state" {
+		t.Fatalf("header = %v, want a state column", rows[0])
+	}
+	var fresh, withdrawn bool
+	for _, row := range rows[1:] {
+		switch row[2] {
+		case "new":
+			fresh = fresh || row[1] == "free-model:free"
+		case "gone":
+			withdrawn = withdrawn || row[0] == "alpha" && row[1] == "retired-model"
+		}
+	}
+	if !fresh {
+		t.Errorf("stdout = %q, want the new model with state new", stdout)
+	}
+	if !withdrawn {
+		t.Errorf("stdout = %q, want the withdrawn model with state gone", stdout)
+	}
+}
+
+func TestDiffMarkdownCarriesBothHalves(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+	storePath := filepath.Join(t.TempDir(), "models-store.json")
+	seedStore(t, storePath, map[string][]string{"alpha": {
+		"zero-model", "paid-model", "retired-model",
+	}})
+
+	code, stdout, stderr := runMain(t, "diff", "-format=md", "-config", path, "-store", storePath)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if !strings.Contains(stdout, "| alpha | free-model:free |") {
+		t.Errorf("stdout does not show the new model:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "## No longer listed (1)") || !strings.Contains(stdout, "- alpha/retired-model") {
+		t.Errorf("stdout does not show the withdrawn model:\n%s", stdout)
+	}
+}
+
+// TestDiffNoChangeLeavesTheRecordAlone pins the save rule: a run
+// where nothing moved must not rewrite the store, so the record's
+// timestamps keep saying when the catalog was last seen to change.
+func TestDiffNoChangeLeavesTheRecordAlone(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+	storePath := filepath.Join(t.TempDir(), "models-store.json")
+
+	if _, _, stderr := runMain(t, "diff", "-config", path, "-store", storePath); !strings.Contains(stderr, "recorded in") {
+		t.Fatalf("first run summary = %q, want it to record the store", stderr)
+	}
+	before, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout, stderr := runMain(t, "diff", "-config", path, "-store", storePath)
+	if code != exitOK {
+		t.Fatalf("second run exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if !strings.Contains(stderr, "nothing changed") {
+		t.Errorf("summary = %q, want it to say the record was left alone", stderr)
+	}
+	if strings.Contains(stdout, "free-model:free") {
+		t.Errorf("a recorded model was reported as new again:\n%s", stdout)
+	}
+	after, err := os.ReadFile(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("the store was rewritten by a run that changed nothing")
+	}
+}
+
+// TestDiffRebuildsACorruptRecord covers the corrupt-cache path:
+// the store treats a file it cannot parse as empty rather than
+// refusing to start, so every model is new and the record is rebuilt.
+func TestDiffRebuildsACorruptRecord(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+	storePath := filepath.Join(t.TempDir(), "models-store.json")
+	if err := os.WriteFile(storePath, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	code, stdout, stderr := runMain(t, "diff", "-config", path, "-store", storePath)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if !strings.Contains(stdout, "free-model:free") {
+		t.Errorf("stdout = %q, want every model reported as new", stdout)
+	}
+	if !strings.Contains(stderr, "2 new") {
+		t.Errorf("summary = %q, want the count of everything", stderr)
+	}
+	if got := storedIDs(t, storePath, "alpha"); !got["free-model:free"] || !got["zero-model"] {
+		t.Errorf("the corrupt record was not rebuilt: %v", got)
+	}
+}
+
+func TestListNewOnlyReadsTheStoreWithoutWritingIt(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+	storePath := filepath.Join(t.TempDir(), "models-store.json")
+	seedStore(t, storePath, map[string][]string{"alpha": {"zero-model"}})
+
+	code, stdout, stderr := runMain(t, "list", "-new-only", "-config", path, "-store", storePath)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d (stderr: %s)", code, exitOK, stderr)
+	}
+	if !strings.Contains(stdout, "free-model:free") {
+		t.Errorf("stdout is missing the model the store had not seen:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "zero-model") {
+		t.Errorf("a known model was listed as new:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "1 new of 2 free models") {
+		t.Errorf("summary = %q, want it to count one of two", stderr)
+	}
+	// -q means the same thing here as it does for a plain listing.
+	if _, _, quiet := runMain(t, "list", "-new-only", "-q", "-config", path, "-store", storePath); quiet != "" {
+		t.Errorf("-q still wrote a summary: %q", quiet)
+	}
+	// The whole point: the store is a record of what has been seen, and reading
+	// it must not count as having seen anything.
+	if got := storedIDs(t, storePath, "alpha"); len(got) != 1 || !got["zero-model"] {
+		t.Errorf("the store changed: %v, want it left as it was found", got)
+	}
+
+	// And the same listing run again still reports the same thing.
+	_, again, _ := runMain(t, "list", "-new-only", "-config", path, "-store", storePath)
+	if !strings.Contains(again, "free-model:free") {
+		t.Errorf("the second -new-only run consumed the novelty:\n%s", again)
+	}
+}
+
+func TestListNewOnlyMarksRowsAsNew(t *testing.T) {
+	srv := gatewayServer(t, modelsPayload, nil)
+	path := writeCatalog(t, catalogProvider(srv.URL, nil))
+	storePath := filepath.Join(t.TempDir(), "models-store.json")
+	seedStore(t, storePath, map[string][]string{"alpha": {"zero-model"}})
+
+	code, stdout, _ := runMain(t, "list", "-new-only", "-json", "-config", path, "-store", storePath)
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d", code, exitOK)
+	}
+	var doc listDoc
+	if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
+		t.Fatalf("stdout is not one JSON document: %v\n%s", err, stdout)
+	}
+	if len(doc.Models) != 1 || !doc.Models[0].New {
+		t.Errorf("models = %+v, want one row flagged new", doc.Models)
+	}
+	// The per-provider counts still describe the whole catalog, not the
+	// narrowed view, so the document does not contradict itself.
+	if len(doc.Providers) != 1 || doc.Providers[0].Free != 2 {
+		t.Errorf("providers = %+v, want the unfiltered counts", doc.Providers)
 	}
 }
 

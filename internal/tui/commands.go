@@ -68,6 +68,10 @@ func probeCmds(ctx context.Context, opts Options, reqs []probe.Request) []tea.Cm
 		req := req
 		cmds = append(cmds, func() tea.Msg {
 			res := probe.Send(ctx, client, req)
+			reason := probe.ClassOK
+			if !res.OK {
+				reason = probe.Classify(res)
+			}
 			return probeMsg{
 				key: probeKey(res.Provider, res.Model),
 				item: probeKeyed{
@@ -76,6 +80,7 @@ func probeCmds(ctx context.Context, opts Options, reqs []probe.Request) []tea.Cm
 					Status:   res.Status,
 					Latency:  res.Latency,
 					Tokens:   res.Tokens,
+					Reason:   reason,
 					Detail:   res.Detail,
 					Request:  res.Request,
 					Response: res.Response,

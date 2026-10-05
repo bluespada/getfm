@@ -10,13 +10,16 @@ import (
 
 // probeRow is the JSON shape of one probe result.
 type probeRow struct {
-	Provider string  `json:"provider"`
-	Model    string  `json:"model"`
-	OK       bool    `json:"ok"`
-	Status   int     `json:"status"`
-	Latency  float64 `json:"latency_ms"`
-	Tokens   int64   `json:"tokens,omitempty"`
-	Detail   string  `json:"detail,omitempty"`
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	OK       bool   `json:"ok"`
+	Status   int    `json:"status"`
+	// Reason names the class of a failure, so a script can tell a wrong key
+	// from a rate limit without matching on the detail text.
+	Reason  string  `json:"reason,omitempty"`
+	Latency float64 `json:"latency_ms"`
+	Tokens  int64   `json:"tokens,omitempty"`
+	Detail  string  `json:"detail,omitempty"`
 }
 
 type probeDoc struct {
@@ -37,10 +40,15 @@ func runTest(args []string) int {
 	limit := fs.Int("n", 0, "with -all, probe at most this many models")
 	concurrency := fs.Int("c", 2, "how many probes to run at once")
 	prompt := fs.String("prompt", probe.DefaultPrompt, "prompt to send")
-	asJSON := fs.Bool("json", false, "emit JSON instead of a table")
+	var out outputFlags
+	out.register(fs)
 
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
+	}
+	format, err := out.resolve()
+	if err != nil {
+		return usageErr(err)
 	}
 	r, err := f.rules()
 	if err != nil {
@@ -112,19 +120,25 @@ func runTest(args []string) int {
 			Tokens:   res.Tokens,
 			Detail:   res.Detail,
 		}
+		// Left empty on success, so the field means "what went wrong" and never
+		// repeats the ok flag.
+		if !res.OK {
+			row.Reason = string(probe.Classify(res))
+		}
 		rows = append(rows, row)
 		if res.OK {
 			okCount++
 		}
 	}
 
-	if *asJSON {
-		doc := probeDoc{Total: len(rows), OK: okCount, Failed: len(rows) - okCount, Results: rows}
-		if err := writeJSON(doc); err != nil {
-			return fail(err)
-		}
-	} else {
-		printProbeTable(rows)
+	doc := probeDoc{Total: len(rows), OK: okCount, Failed: len(rows) - okCount, Results: rows}
+	if err := writeProbeDoc(format, doc); err != nil {
+		return fail(err)
+	}
+	// The summary is the closing line -q drops, whatever the format:
+	// the same rule as list, so a script sees one behavior across
+	// commands.
+	if !out.quiet {
 		fmt.Fprintf(os.Stderr, "\n%d of %d endpoints responded successfully.\n", okCount, len(rows))
 	}
 
@@ -212,18 +226,22 @@ func findRef(run *catalogRun, providerName, model string) string {
 
 func printProbeTable(rows []probeRow) {
 	t := newTable()
-	fmt.Fprintln(t, "PROVIDER\tMODEL\tRESULT\tLATENCY\tTOKENS\tDETAIL")
+	fmt.Fprintln(t, "PROVIDER\tMODEL\tRESULT\tREASON\tLATENCY\tTOKENS\tDETAIL")
 	for _, r := range rows {
 		result := fmt.Sprintf("%d", r.Status)
 		if r.Status == 0 {
 			result = "ERR"
 		}
+		reason := r.Reason
+		if reason == "" {
+			reason = "-"
+		}
 		detail := r.Detail
 		if detail == "" && r.OK {
 			detail = "-"
 		}
-		fmt.Fprintf(t, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			r.Provider, r.Model, result,
+		fmt.Fprintf(t, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			r.Provider, r.Model, result, reason,
 			fmt.Sprintf("%.0fms", r.Latency),
 			formatTokens(r.Tokens),
 			detail)

@@ -12,10 +12,16 @@ func runList(args []string) int {
 	g.register(fs)
 	var f filterFlags
 	f.register(fs)
-	asJSON := fs.Bool("json", false, "emit JSON instead of a table")
+	var out outputFlags
+	out.register(fs)
+	newOnly := fs.Bool("new-only", false, "list only models the store has not recorded yet")
 
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
+	}
+	format, err := out.resolve()
+	if err != nil {
+		return usageErr(err)
 	}
 	r, err := f.rules()
 	if err != nil {
@@ -31,21 +37,43 @@ func runList(args []string) int {
 	}
 	sel := collect(run, r)
 
-	if *asJSON {
-		doc := listDoc{
-			Free:      filterDocFrom(f.spec, f.suffix, f.allow),
-			Providers: statuses(run, sel),
-			Models:    sel.rows,
-		}
-		if doc.Models == nil {
-			doc.Models = []modelRow{}
-		}
-		if err := writeJSON(doc); err != nil {
+	storePath, err := resolveStorePath(g.storePath)
+	if err != nil {
+		return fail(err)
+	}
+	doc := listDoc{
+		Free:      filterDocFrom(f.spec, f.suffix, f.allow),
+		Providers: statuses(run, sel),
+		Models:    sel.rows,
+	}
+	newListed := 0
+	if *newOnly {
+		// Read against the store as it was before this run, and without writing
+		// it back: a listing that consumed its own novelty would make the next
+		// -new-only call silently empty.
+		fresh, err := onlyNew(storePath, run, sel)
+		if err != nil {
 			return fail(err)
 		}
-	} else {
-		printModelTable(sel.rows)
+		doc.Models = fresh
+		newListed = len(fresh)
+	}
+
+	// The table's own empty state talks about the free rules, which are not
+	// what decided there was nothing to print. Skipping the table leaves
+	// stdout empty either way, since it would have had no rows.
+	if format == formatTable && *newOnly && newListed == 0 {
+		fmt.Fprintln(os.Stderr, "No model is new since the last run.")
+	} else if err := writeListDoc(format, doc); err != nil {
+		return fail(err)
+	}
+	if format != formatJSON {
 		printProviderProblems(run.failures())
+	}
+	switch {
+	case *newOnly && !out.quiet:
+		printNewSummary(sel, newListed, storePath)
+	case !*newOnly && !out.quiet:
 		printSummary(run, sel)
 	}
 

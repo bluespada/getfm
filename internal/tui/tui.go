@@ -151,7 +151,10 @@ type probeKeyed struct {
 	Status  int
 	Latency time.Duration
 	Tokens  int64
-	Detail  string
+	// Reason is the class of a failure, so the card can say what went wrong
+	// rather than only how the request ended.
+	Reason probe.Class
+	Detail string
 	// Request and Response are what crossed the wire, already redacted.
 	Request  probe.Prepared
 	Response *probe.Exchange
