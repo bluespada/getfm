@@ -197,6 +197,9 @@ func (d *modal) renderRequest() string {
 			}
 		}
 		b.WriteString(d.cardField("status", state+"  "+fmt.Sprintf("%.0fms", float64(d.result.Latency.Microseconds())/1000)))
+		if !d.result.OK {
+			b.WriteString(d.cardField("reason", classLabel(d.result.Reason)))
+		}
 		if d.result.Tokens > 0 {
 			b.WriteString(d.cardField("tokens", fmt.Sprintf("%d", d.result.Tokens)))
 		}
@@ -265,6 +268,32 @@ func (d *modal) cardField(label, value string) string {
 		b.WriteString(indent + valueStyle.Render(line) + "\n")
 	}
 	return b.String()
+}
+
+// classInk picks the colour a failure class is drawn in, by how much the reader
+// has to do about it. A rate limit, a timeout, a network blip and a
+// provider-side 5xx are worth retrying later rather than fixing: none of
+// them are the reader's fault. A rejected credential, an exhausted
+// allowance, a malformed request and a bad catalog entry are things to go
+// and fix. A withdrawn model is history.
+func classInk(c probe.Class) lipgloss.Color {
+	switch c {
+	case probe.ClassRate, probe.ClassTimeout, probe.ClassNetwork, probe.ClassServer:
+		return colWarn
+	case probe.ClassGone, probe.ClassUnknown:
+		return colMuted
+	default:
+		return colErr
+	}
+}
+
+// classLabel renders a failure class in that colour. An unset class still reads
+// as "unknown" rather than as an empty field.
+func classLabel(c probe.Class) string {
+	if c == "" {
+		c = probe.ClassUnknown
+	}
+	return lipgloss.NewStyle().Foreground(classInk(c)).Render(string(c))
 }
 
 // modalityText reports input/output modalities when the provider publishes them.

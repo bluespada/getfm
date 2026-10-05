@@ -171,6 +171,57 @@ func TestRequestPageShowsResponseWhenProbed(t *testing.T) {
 	}
 }
 
+func TestRequestPageNamesTheFailureClass(t *testing.T) {
+	m := readyModel(t)
+	sel := m.visible[0]
+	m.probes[probeKey(sel.Provider, sel.ID)] = probeKeyed{
+		Model:  sel,
+		Status: 401,
+		Reason: probe.ClassAuth,
+		Detail: `{"error":{"message":"Incorrect key provided"}}`,
+	}
+
+	send(m, enterMsg())
+	send(m, tabMsg())
+	body := plain(m.modal.render())
+
+	for _, want := range []string{"last probe", "401", "reason", "auth"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("failure page is missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestClassLabelTintsBySeverity pins that a throttle and a rejected credential
+// do not look alike: one is the provider working, the other is something the
+// user has to fix. The colours are compared rather than the rendered strings,
+// which say nothing once the terminal is not colouring output.
+func TestClassLabelTintsBySeverity(t *testing.T) {
+	if classInk(probe.ClassAuth) == classInk(probe.ClassRate) {
+		t.Error("an auth failure and a rate limit are tinted the same")
+	}
+	if classInk(probe.ClassGone) != colMuted {
+		t.Error("a withdrawn model is history, and should read as muted")
+	}
+	// Whatever the reader only has to wait out shares the rate limit's
+	// amber: a throttle, a timeout, a network blip and a provider-side
+	// fault are all retryable, none of them are the reader's to fix.
+	for _, c := range []probe.Class{probe.ClassRate, probe.ClassTimeout, probe.ClassNetwork, probe.ClassServer} {
+		if classInk(c) != colWarn {
+			t.Errorf("class %q is retryable, and should not be drawn as %v", c, classInk(c))
+		}
+	}
+	// Whatever the reader has to fix shares the auth failure's red.
+	for _, c := range []probe.Class{probe.ClassAuth, probe.ClassQuota, probe.ClassRequest, probe.ClassConfig} {
+		if classInk(c) != colErr {
+			t.Errorf("class %q needs fixing, and should be drawn as an error", c)
+		}
+	}
+	if plain(classLabel("")) != string(probe.ClassUnknown) {
+		t.Errorf("an unset class rendered as %q, want unknown", plain(classLabel("")))
+	}
+}
+
 func TestModalStaysInsideTerminal(t *testing.T) {
 	for _, size := range [][2]int{{80, 24}, {120, 40}, {160, 50}, {60, 18}} {
 		w, h := size[0], size[1]
