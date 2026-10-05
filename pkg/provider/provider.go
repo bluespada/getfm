@@ -4,6 +4,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -44,8 +45,10 @@ type Catalog map[string][]Model
 type FetchResult struct {
 	Provider string
 	Models   []Model
-	Err      error
-	Elapsed  int64 // milliseconds
+	// Err describes the failure, scrubbed of credentials, because it is
+	// printed and JSON-encoded verbatim.
+	Err     error
+	Elapsed int64 // milliseconds
 }
 
 // Options controls how catalogs are fetched.
@@ -87,6 +90,12 @@ func Fetch(ctx context.Context, client *http.Client, file *config.File, opts Opt
 				key = opts.Key(p)
 			}
 			models, err := List(ctx, client, &p, key, opts)
+			if err != nil {
+				// The error text reaches stderr and JSON output verbatim, and
+				// a configured URL can carry a credential, so it is scrubbed
+				// here, while the key is still in hand.
+				err = errors.New(Excerpt([]byte(err.Error()), 160, key))
+			}
 			results[i] = FetchResult{
 				Provider: p.Name,
 				Models:   models,
