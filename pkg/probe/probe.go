@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -75,10 +76,140 @@ type Result struct {
 	Tokens   int64         `json:"tokens,omitempty"`
 	// Detail carries the reason a probe failed, trimmed to stay readable.
 	Detail string `json:"detail,omitempty"`
+	// Reason is the class of failure, captured only where it cannot be
+	// recovered later: a transport error is typed information that Detail
+	// flattens away. Classify fills in everything else.
+	Reason Class `json:"reason,omitempty"`
 
 	// Request is what was sent and Response what came back, both redacted.
 	Request  Prepared  `json:"request,omitempty"`
 	Response *Exchange `json:"response,omitempty"`
+}
+
+// Class is a coarse category for a probe outcome.
+//
+// A status code and a captured body say what happened; a class says what it
+// means for the person running the probe, which is the question the raw numbers
+// leave open: is the key wrong, is the allowance spent, or has the model been
+// withdrawn?
+type Class string
+
+const (
+	ClassOK   Class = "ok"
+	ClassAuth Class = "auth"
+	// ClassQuota is an authenticated request that ran out of allowance.
+	ClassQuota Class = "quota"
+	// ClassRate is throttling, which is worth retrying later.
+	ClassRate Class = "rate"
+	// ClassGone means the provider no longer offers this model.
+	ClassGone Class = "gone"
+	// ClassRequest is any other 4xx: the request itself was wrong, a body
+	// the endpoint would not accept or a model it will not serve under
+	// that name.
+	ClassRequest Class = "request"
+	// ClassServer is a failure on the provider's side rather than ours.
+	ClassServer Class = "server"
+	// ClassNetwork never reached the provider at all.
+	ClassNetwork Class = "network"
+	ClassTimeout Class = "timeout"
+	// ClassConfig is a malformed catalog entry: a body that is not JSON, a
+	// host that does not resolve, or an endpoint that bounces forever.
+	ClassConfig  Class = "config"
+	ClassUnknown Class = "unknown"
+)
+
+// Classify names the class of a result.
+//
+// A Reason captured by Send wins when present, since that is the one judgement
+// made while the typed error was still in hand; everything else is derived from
+// the status and the captured body.
+func Classify(res Result) Class {
+	if res.OK {
+		return ClassOK
+	}
+	if res.Reason != "" {
+		return res.Reason
+	}
+	// No status means the request never completed, so the body is empty and
+	// only the detail can be read.
+	if res.Status == 0 {
+		if mentionsAny(res.Detail, "timeout", "timed out", "deadline exceeded") {
+			return ClassTimeout
+		}
+		return ClassNetwork
+	}
+	return classForStatus(res.Status, res.Detail)
+}
+
+// classForStatus maps an HTTP response to a class. The ambiguous codes are
+// resolved by reading the body, which is the only place the distinction is made.
+func classForStatus(status int, detail string) Class {
+	switch {
+	case status == http.StatusUnauthorized, status == http.StatusForbidden:
+		return ClassAuth
+	case status == http.StatusPaymentRequired:
+		// Payment required is unambiguous: it is the provider asking to be paid.
+		return ClassQuota
+	case status == http.StatusTooManyRequests:
+		// A 429 is either throttling or an exhausted allowance, and the two call
+		// for opposite responses: come back later, or top up.
+		if mentionsAny(detail, "quota", "billing", "credit", "balance", "insufficient") {
+			return ClassQuota
+		}
+		return ClassRate
+	case status == http.StatusNotFound, status == http.StatusGone:
+		// A 404 is read as a withdrawn model rather than a misconfigured
+		// path: the probe targets one model, so a missing endpoint and a
+		// missing model look the same here.
+		return ClassGone
+	case status >= 500:
+		return ClassServer
+	case status >= 300 && status < 400:
+		// The client follows redirects, so a 3xx only surfaces when it gave
+		// up: the endpoint is configured to bounce forever.
+		return ClassConfig
+	default:
+		// Any other 4xx is the request itself.
+		return ClassRequest
+	}
+}
+
+// classifyTransport reads the typed error a failed request produced.
+func classifyTransport(err error) Class {
+	// A name that does not resolve is a catalog problem, and it is
+	// checked before the timeout cases: a resolver that times out is
+	// still a host that never resolved.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return ClassConfig
+	}
+	// Timeout is checked before anything else because a timeout is never the
+	// caller's fault, whereas the classes below are.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return ClassTimeout
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ClassTimeout
+	}
+	if mentionsAny(err.Error(), "timeout", "timed out", "deadline exceeded") {
+		return ClassTimeout
+	}
+	return ClassNetwork
+}
+
+// mentionsAny reports a case-insensitive hit for any of the needles. It is
+// deliberately loose: these strings are read out of bodies meant for humans and
+// for other clients, and a miss only costs precision, never correctness of the
+// status-based fallback.
+func mentionsAny(haystack string, needles ...string) bool {
+	lower := strings.ToLower(haystack)
+	for _, n := range needles {
+		if strings.Contains(lower, n) {
+			return true
+		}
+	}
+	return false
 }
 
 // Request describes a single probe.
@@ -141,7 +272,11 @@ func Send(ctx context.Context, client *http.Client, req Request) Result {
 
 	prep, err := Prepare(req)
 	if err != nil {
-		res.Detail = err.Error()
+		// The catalog itself is at fault, not the endpoint. The text is
+		// scrubbed like a body, because a rendered path can echo a
+		// configured credential.
+		res.Reason = ClassConfig
+		res.Detail = provider.Excerpt([]byte(err.Error()), 140, req.Key)
 		return res
 	}
 
@@ -154,7 +289,8 @@ func Send(ctx context.Context, client *http.Client, req Request) Result {
 
 	httpReq, err := http.NewRequestWithContext(ctx, prep.Method, prep.URL, bytes.NewReader([]byte(prep.Body)))
 	if err != nil {
-		res.Detail = fmt.Sprintf("build request: %v", err)
+		res.Reason = ClassConfig
+		res.Detail = provider.Excerpt([]byte(fmt.Sprintf("build request: %v", err)), 140, req.Key)
 		return res
 	}
 	httpReq.Header = prep.Header.Clone()
@@ -168,6 +304,10 @@ func Send(ctx context.Context, client *http.Client, req Request) Result {
 	resp, err := client.Do(httpReq)
 	res.Latency = time.Since(start)
 	if err != nil {
+		// Classified here rather than on the detail string, because a dial
+		// error is the one failure whose type is lost the moment it is
+		// flattened for display.
+		res.Reason = classifyTransport(err)
 		// A dial error is shown the same way a body is: flattened, shortened
 		// and scrubbed, since a URL or a proxy error can carry a credential.
 		res.Detail = provider.Excerpt([]byte(err.Error()), 140, req.Key)

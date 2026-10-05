@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -261,5 +262,90 @@ func TestPrepareRejectsProviderWithoutCompletions(t *testing.T) {
 	_, err := Prepare(Request{Provider: config.Provider{Name: "bare"}})
 	if err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+func TestClassify(t *testing.T) {
+	cases := []struct {
+		name string
+		res  Result
+		want Class
+	}{
+		{"ok", Result{OK: true, Status: 200}, ClassOK},
+		{"rejected credential", Result{Status: http.StatusUnauthorized}, ClassAuth},
+		{"forbidden", Result{Status: http.StatusForbidden}, ClassAuth},
+		{"payment required", Result{Status: http.StatusPaymentRequired}, ClassQuota},
+		{"throttled", Result{Status: http.StatusTooManyRequests,
+			Detail: `{"error":{"message":"rate limit exceeded"}}`}, ClassRate},
+		{"allowance spent", Result{Status: http.StatusTooManyRequests,
+			Detail: `{"error":{"code":"insufficient_quota"}}`}, ClassQuota},
+		{"withdrawn", Result{Status: http.StatusNotFound}, ClassGone},
+		{"provider fault", Result{Status: http.StatusBadGateway}, ClassServer},
+		{"bad request", Result{Status: http.StatusBadRequest}, ClassRequest},
+		{"endpoint bounces forever", Result{Status: http.StatusMovedPermanently}, ClassConfig},
+		{"captured class wins", Result{Status: http.StatusBadGateway, Reason: ClassConfig}, ClassConfig},
+		{"never reached the provider", Result{Status: 0, Detail: "dial tcp: connection refused"}, ClassNetwork},
+		{"gave up waiting", Result{Status: 0, Detail: "context deadline exceeded"}, ClassTimeout},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Classify(tc.res); got != tc.want {
+				t.Errorf("Classify(%+v) = %q, want %q", tc.res, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClassifyPrefersTheCapturedReason pins why Send records a class at all: the
+// status of a request that never completed says nothing, and only the typed
+// error that produced it can tell a timeout from a refused connection.
+func TestClassifyPrefersTheCapturedReason(t *testing.T) {
+	unreachable := Result{Detail: "context deadline exceeded (Client.Timeout)"}
+	if got := Classify(unreachable); got != ClassTimeout {
+		t.Errorf("a detail-only result classified as %q, want timeout from the text", got)
+	}
+	captured := Result{Detail: "context deadline exceeded (Client.Timeout)", Reason: ClassNetwork}
+	if got := Classify(captured); got != ClassNetwork {
+		t.Errorf("Classify = %q, want the captured class to win over the text", got)
+	}
+}
+
+// TestClassifyRefusedConnection checks the end to end path against a port that
+// is certainly closed, so the transport error is real rather than constructed.
+func TestClassifyRefusedConnection(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	base := srv.URL
+	srv.Close() // nothing is listening now, so the dial is refused
+
+	res := Send(context.Background(), http.DefaultClient, Request{
+		Provider: testProvider(base),
+		Model:    "m",
+		Ref:      "m",
+	})
+	if res.OK {
+		t.Fatal("expected the probe to fail")
+	}
+	if got := Classify(res); got != ClassNetwork {
+		t.Errorf("Classify = %q, want %q for a refused connection", got, ClassNetwork)
+	}
+}
+
+// TestClassifyTransportReadsADNSFailureAsConfig pins the order the
+// typed errors are read in: a resolver timeout is still a host that
+// never resolved, so it is a catalog problem even though it timed out.
+func TestClassifyTransportReadsADNSFailureAsConfig(t *testing.T) {
+	err := &net.DNSError{Err: "i/o timeout", Name: "catalog.invalid", IsTimeout: true}
+	if got := classifyTransport(err); got != ClassConfig {
+		t.Errorf("classifyTransport(DNSError{IsTimeout: true}) = %q, want %q", got, ClassConfig)
+	}
+}
+
+func TestSendWithoutCompletionsIsClassifiedAsConfig(t *testing.T) {
+	res := Send(context.Background(), http.DefaultClient, Request{
+		Provider: config.Provider{Name: "bare"},
+		Model:    "m",
+	})
+	if got := Classify(res); got != ClassConfig {
+		t.Errorf("Classify = %q, want %q for a catalog entry with no endpoint", got, ClassConfig)
 	}
 }
