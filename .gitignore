@@ -36,3 +36,6 @@ bin/
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Pi agent local state (workflows, prompts, run artifacts)
+.pi/
